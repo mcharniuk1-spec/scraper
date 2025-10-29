@@ -2,6 +2,7 @@ name: Scheduled Scraping
 
 on:
   schedule:
+    # Запускаємо кожні 12 годин
     - cron: '0 */12 * * *'
   workflow_dispatch:
 
@@ -10,7 +11,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -22,20 +24,84 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Запуск Fora‑скрапера (шлях до скрипта: scraper/scraper.py)
       - name: Run Fora scraper
         run: |
           mkdir -p data
-          python scraper.py --db data/fora_listings.db --excel data/fora_listings.xlsx
+          python scraper/scraper.py --db data/fora_listings.db
 
+      # Конвертація Fora‑БД у Excel та запис прогресу
+      - name: Export Fora DB to Excel and log progress
+        run: |
+          python - <<'PY'
+          import sqlite3, pandas as pd
+          from datetime import datetime, timezone
+
+          db_path = 'data/fora_listings.db'
+          excel_path = 'data/fora_listings.xlsx'
+          progress_path = 'data/fora_progress.txt'
+
+          conn = sqlite3.connect(db_path)
+          cur = conn.cursor()
+          # кількість записів у таблиці listings
+          try:
+              cur.execute("SELECT COUNT(*) FROM listings")
+              count = cur.fetchone()[0]
+          except Exception:
+              count = 0
+          # конвертація в Excel (якщо таблиця є)
+          try:
+              df = pd.read_sql_query(
+                  "SELECT url, title, snippet, image_url, price, currency, date_posted, scraped_at "
+                  "FROM listings ORDER BY scraped_at DESC",
+                  conn
+              )
+              df.to_excel(excel_path, index=False)
+          except Exception as e:
+              print('Export to Excel failed:', e)
+          # запис рядка прогресу (UTC‑час та кількість товарів)
+          with open(progress_path, 'a', encoding='utf-8') as f:
+              ts = datetime.now(timezone.utc).isoformat()
+              f.write(f"{ts}\t{count}\n")
+          conn.close()
+          PY
+
+      # Запуск Novus‑скрапера (припускаємо, що novus_scraper.py у корені репо)
       - name: Run Novus scraper
         run: |
           mkdir -p data
           python novus_scraper.py --db data/novus_listings.db --excel data/novus_listings.xlsx
 
+      # Запис прогресу для Novus
+      - name: Log progress for Novus
+        run: |
+          python - <<'PY'
+          import sqlite3
+          from datetime import datetime, timezone
+
+          db_path = 'data/novus_listings.db'
+          progress_path = 'data/novus_progress.txt'
+
+          try:
+              conn = sqlite3.connect(db_path)
+              cur = conn.cursor()
+              cur.execute("SELECT COUNT(*) FROM listings")
+              count = cur.fetchone()[0]
+              conn.close()
+          except Exception:
+              count = 0
+
+          with open(progress_path, 'a', encoding='utf-8') as f:
+              ts = datetime.now(timezone.utc).isoformat()
+              f.write(f"{ts}\t{count}\n")
+          PY
+
+      # Коміт результатів та журналів у репозиторій
       - name: Commit scraped data
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add data/*.db data/*.xlsx || true
-          git diff-index --quiet HEAD || git commit -m 'Update scraped data'
+          git add data/*
+          # Коміт відбувається лише за наявності змін
+          git diff-index --quiet HEAD || git commit -m 'Update scraped data and progress logs'
           git push
