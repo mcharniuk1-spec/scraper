@@ -9,7 +9,8 @@
 Запуск:
     python novus_scraper.py --db data/novus_listings.db \
                             --excel data/novus_listings.xlsx \
-                            --progress data/novus_progress.txt
+                            --progress data/novus_progress.txt \
+                            --max-pages 10
 """
 
 import argparse
@@ -35,18 +36,15 @@ USER_AGENT = (
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
-
 def log_progress(progress_path: str, message: str) -> None:
     os.makedirs(os.path.dirname(progress_path), exist_ok=True)
     with open(progress_path, "a", encoding="utf-8") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
 
-
 def get_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     return session
-
 
 @backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
 def fetch(session: requests.Session, url: str) -> str:
@@ -54,18 +52,14 @@ def fetch(session: requests.Session, url: str) -> str:
     resp.raise_for_status()
     return resp.text
 
-
 def extract_product_links(html: str) -> List[str]:
     soup = BeautifulSoup(html, "lxml")
     links: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href.startswith("/uk/products/"):
-            full_url = "https://novus.zakaz.ua" + href
-            links.append(full_url)
-    # унікальні
+            links.append("https://novus.zakaz.ua" + href)
     return list(dict.fromkeys(links))
-
 
 def parse_product_page(session: requests.Session, url: str) -> Dict[str, Optional[str]]:
     html = fetch(session, url)
@@ -102,7 +96,6 @@ def parse_product_page(session: requests.Session, url: str) -> Dict[str, Optiona
         "url": url,
     }
 
-
 def scrape_category(max_pages: Optional[int], progress_path: str) -> List[Dict[str, Optional[str]]]:
     session = get_session()
     all_products: List[Dict[str, Optional[str]]] = []
@@ -127,12 +120,11 @@ def scrape_category(max_pages: Optional[int], progress_path: str) -> List[Dict[s
                 log_progress(progress_path, f"Отримано товар Novus: {data['title']} ({link})")
             except requests.HTTPError as e:
                 logging.error(f"Помилка завантаження товару {link}: {e}")
-            time.sleep(0.2)
+            time.sleep(0.1)
         page_num += 1
         if max_pages is not None and page_num > max_pages:
             break
     return all_products
-
 
 def save_to_db(products: List[Dict[str, Optional[str]]], db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -170,27 +162,23 @@ def save_to_db(products: List[Dict[str, Optional[str]]], db_path: str) -> None:
     conn.commit()
     conn.close()
 
-
 def export_to_excel(products: List[Dict[str, Optional[str]]], excel_path: str) -> None:
     os.makedirs(os.path.dirname(excel_path), exist_ok=True)
     df = pd.DataFrame(products)
     df.to_excel(excel_path, index=False)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Novus/Zakaz.ua category scraper")
     parser.add_argument("--db", default="data/novus_listings.db", help="Шлях до SQLite-бази")
     parser.add_argument("--excel", default="data/novus_listings.xlsx", help="Шлях до Excel-файлу")
     parser.add_argument("--progress", default="data/novus_progress.txt", help="Файл для прогресу")
-    parser.add_argument("--max-pages", type=int, default=10,10
+    parser.add_argument("--max-pages", type=int, default=10,
                         help="Максимальна кількість сторінок для скрапінгу")
     args = parser.parse_args()
-
     products = scrape_category(args.max_pages, args.progress)
     save_to_db(products, args.db)
     export_to_excel(products, args.excel)
     logging.info(f"Зібрано {len(products)} товарів на Novus.")
-
 
 if __name__ == "__main__":
     main()
