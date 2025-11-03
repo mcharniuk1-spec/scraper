@@ -1,238 +1,211 @@
 #!/usr/bin/env python3
 """
-Novus dairy and eggs category scraper
+Скрапер для категорії «Молочні продукти та яйця» на Novus (Zakaz.ua).
 
-This script scrapes product pages from the Novus Zakaz.ua dairy and eggs category and stores the results in a local SQLite database by default. It also has an option to export results to an Excel file. It navigates category pages, collects product links, visits each product page to extract details such as title, price, currency, and description, and writes them to the database. Logs are emitted to track progress.
+- Збирає назву, ціну, валюту, опис, посилання на зображення та URL.
+- Підтримує інкрементальне оновлення бази даних (URL як унікальний ключ).
+- Експортує результати у SQLite та Excel.
+- Логує прогрес у текстовий файл.
+
+Запуск:
+    python novus_scraper.py --db data/novus_listings.db \
+                            --excel data/novus_listings.xlsx \
+                            --progress data/progress_novus.txt
 """
+
 import argparse
 import logging
 import os
 import re
 import sqlite3
-import sys
 import time
-from typing import Dict, List, Set
+from typing import Dict, List, Optional
 
-import requests
-from bs4 import BeautifulSoup
 import backoff
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 
+# Базовий URL для категорії
 BASE_CATEGORY_URL = "https://novus.zakaz.ua/uk/categories/dairy-and-eggs/"
-DEFAULT_DB_PATH = os.path.join("data", "novus_listings.db")
-USER_AGENT = "novus-scraper/1.0 (+https://github.com/yourname/novus-scraper) Python-requests"
-REQUESTS_TIMEOUT = 20  # seconds
-SLEEP_BETWEEN_REQUESTS = 0.5
-MAX_PAGES = 100  # safety cap
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/118.0.0.0 Safari/537.36"
+)
 
-logger = logging.getLogger("novus_scraper")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def ensure_data_dir(db_path: str) -> None:
-    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+def log_progress(progress_path: str, message: str) -> None:
+    """Додає рядок у файл прогресу."""
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
+    with open(progress_path, "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
 
 
-def get_session(user_agent: str = USER_AGENT) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": user_agent, "Accept-Language": "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7"})
-    adapter = requests.adapters.HTTPAdapter(
-        max_retries=requests.adapters.Retry(
-            total=5,
-            backoff_factor=0.8,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=frozenset(["GET", "HEAD"])
-        )
-    )
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+def get_session() -> requests.Session:
+    """Створює HTTP-сесію з заголовком User-Agent."""
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
 
 
-@backoff.on_exception(backoff.expo, (requests.exceptions.RequestException,), max_time=60)
+@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
 def fetch(session: requests.Session, url: str) -> str:
-    logger.info("Fetching %s", url)
-    r = session.get(url, timeout=REQUESTS_TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    """Завантажує HTML-сторінку з повторними спробами у разі помилки."""
+    resp = session.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.text
 
 
-def parse_category_page(html: str) -> List[str]:
-    """Parse a category page and return a list of product page URLs."""
+def extract_product_links(html: str) -> List[str]:
+    """Повертає унікальні посилання на всі товари зі сторінки категорії."""
     soup = BeautifulSoup(html, "lxml")
-    links = set()
+    links: List[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/products/" in href:
-            full_url = requests.compat.urljoin(BASE_CATEGORY_URL, href)
-            links.add(full_url)
-    return list(links)
-
-
-def scrape_category(session: requests.Session, start_url: str, max_pages: int = 0) -> List[str]:
-    """Iterate over pagination in the category and collect product links."""
-    page_num = 1
-    all_links: Set[str] = set()
-    while True:
-        url = start_url if page_num == 1 else f"{start_url}?page={page_num}"
-        if max_pages and page_num > max_pages:
-            logger.info("Reached max pages (%s). Stopping.", max_pages)
-            break
-        if page_num > MAX_PAGES:
-            logger.warning("Reached safety MAX_PAGES (%s). Stopping.", MAX_PAGES)
-            break
-        try:
-            html = fetch(session, url)
-        except Exception as e:
-            logger.exception("Failed to fetch category page %s: %s", url, e)
-            break
-        links = parse_category_page(html)
-        logger.info("Found %d product links on page %d", len(links), page_num)
-        new_links = [link for link in links if link not in all_links]
-        if not new_links:
-            logger.info("No new product links found on page %d. Stopping.", page_num)
-            break
-        all_links.update(new_links)
-        page_num += 1
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-    return list(all_links)
-
-
-CURRENCY_RE = re.compile(r"(\d[\d\s,\.]*)\s*(₴|грн|uah|UAH)", re.IGNORECASE)
+        if href.startswith("/uk/products/"):
+            full_url = "https://novus.zakaz.ua" + href
+            links.append(full_url)
+    return list(dict.fromkeys(links))
 
 
 def parse_product_page(session: requests.Session, url: str) -> Dict[str, Optional[str]]:
-    html = get_with_backoff(session, url)
+    """Парсить сторінку товару, повертаючи всі деталі."""
+    html = fetch(session, url)
     soup = BeautifulSoup(html, "lxml")
-    # Назва товару
-    title = soup.find("h1")
-    title_text = title.get_text(strip=True) if title else None
-    # Пошук ціни регулярним виразом
-    price_match = re.search(r"([0-9]+[,.]?[0-9]*)\s*₴", soup.get_text())
-    price = float(price_match.group(1).replace(",", ".")) if price_match else None
-    currency = "₴" if price_match else None
-    # Опис
-    desc_el = soup.find("p", class_="product-description") or soup.find("div", {"data-testid": "product-description"})
-    description = desc_el.get_text(strip=True) if desc_el else None
+
+    title = None
+    price = None
+    currency = None
+    description = None
+    image_url = None
+
+    # Назва (h1)
+    h1 = soup.find("h1")
+    if h1:
+        title = h1.get_text(strip=True)
+
+    # Ціна: шукаємо будь-яке число зі знаком гривні в тексті
+    text = soup.get_text(" ", strip=True)
+    m = re.search(r"([\d,.]+)\s*₴", text)
+    if m:
+        price = float(m.group(1).replace(",", "."))
+        currency = "₴"
+
+    # Опис: кілька варіантів пошуку
+    desc_el = (
+        soup.find("p", class_=re.compile("product-description"))
+        or soup.find("div", {"data-testid": "product-description"})
+        or soup.find("p")
+    )
+    if desc_el:
+        description = desc_el.get_text(strip=True)
+
     # Зображення
-    img_el = soup.find("img", {"data-testid": "product-image"})
-    img_url = img_el["src"] if img_el else None
+    img_el = soup.find("img", {"src": re.compile(r"^https://")})
+    if img_el:
+        image_url = img_el["src"]
+
     return {
-        "title": title_text,
+        "title": title,
         "price": price,
         "currency": currency,
         "description": description,
-        "image_url": img_url,
+        "image_url": image_url,
         "url": url,
     }
 
 
+def scrape_category(max_pages: Optional[int], progress_path: str) -> List[Dict[str, Optional[str]]]:
+    """Проходить по всіх сторінках категорії, збираючи інформацію про товари."""
+    session = get_session()
+    all_products: List[Dict[str, Optional[str]]] = []
+    page_num = 1
 
-def init_db(db_path: str) -> sqlite3.Connection:
-    ensure_data_dir(db_path)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+    while True:
+        url = BASE_CATEGORY_URL + (f"?page={page_num}" if page_num > 1 else "")
+        logging.info(f"Завантаження сторінки {page_num}: {url}")
+        log_progress(progress_path, f"Категорія Novus: сторінка {page_num} ({url})")
+        try:
+            html = fetch(session, url)
+        except requests.HTTPError as e:
+            logging.error(f"Не вдалося завантажити {url}: {e}")
+            break
+
+        product_links = extract_product_links(html)
+        if not product_links:
+            logging.info("Немає нових посилань на товари. Завершення скрапінгу.")
+            break
+
+        logging.info(f"Знайдено {len(product_links)} товарів на сторінці {page_num}")
+        for link in product_links:
+            try:
+                data = parse_product_page(session, link)
+                all_products.append(data)
+                log_progress(progress_path, f"Отримано товар Novus: {data['title']} ({link})")
+            except requests.HTTPError as e:
+                logging.error(f"Помилка завантаження товару {link}: {e}")
+            time.sleep(0.2)
+
+        page_num += 1
+        if max_pages is not None and page_num > max_pages:
+            break
+
+    return all_products
+
+
+def save_to_db(products: List[Dict[str, Optional[str]]], db_path: str) -> None:
+    """Зберігає або оновлює записи в SQLite, унікальність визначається URL."""
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS listings (
+        CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
             title TEXT,
-            snippet TEXT,
-            image_url TEXT,
             price REAL,
             currency TEXT,
-            date_posted TEXT,
-            scraped_at TEXT
+            description TEXT,
+            image_url TEXT,
+            url TEXT UNIQUE
         )
         """
     )
-    conn.commit()
-    return conn
-
-
-def upsert_listing(conn: sqlite3.Connection, item: Dict) -> None:
-    cur = conn.cursor()
-    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    try:
+    for p in products:
         cur.execute(
             """
-            INSERT INTO listings (url, title, snippet, image_url, price, currency, date_posted, scraped_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-              title=excluded.title,
-              snippet=excluded.snippet,
-              image_url=excluded.image_url,
-              price=excluded.price,
-              currency=excluded.currency,
-              date_posted=excluded.date_posted,
-              scraped_at=excluded.scraped_at
+            INSERT OR REPLACE INTO products
+            (title, price, currency, description, image_url, url)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                item.get("url"),
-                item.get("title"),
-                item.get("snippet"),
-                item.get("image_url"),
-                item.get("price"),
-                item.get("currency"),
-                item.get("date_posted"),
-                now,
-            ),
+            (p["title"], p["price"], p["currency"], p["description"], p["image_url"], p["url"]),
         )
-    except sqlite3.Error as e:
-        logger.exception("DB insert failed for %s: %s", item.get("url"), e)
     conn.commit()
-
-
-def export_excel(conn: sqlite3.Connection, path: str) -> None:
-    cur = conn.cursor()
-    cur.execute("SELECT url, title, snippet, image_url, price, currency, date_posted, scraped_at FROM listings ORDER BY scraped_at DESC")
-    rows = cur.fetchall()
-    columns = ["url", "title", "snippet", "image_url", "price", "currency", "date_posted", "scraped_at"]
-    df = pd.DataFrame(rows, columns=columns)
-    ensure_data_dir(path)
-    df.to_excel(path, index=False)
-    logger.info("Exported %d rows to %s", len(df), path)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Novus Zakaz.ua dairy and eggs category scraper")
-    p.add_argument("--start-url", default=BASE_CATEGORY_URL)
-    p.add_argument("--db", default=DEFAULT_DB_PATH)
-    p.add_argument("--excel", help="Export Excel file path after scraping")
-    p.add_argument("--max-pages", type=int, default=0, help="Max pages to fetch (0 = no limit)")
-    p.add_argument("--user-agent", default=USER_AGENT)
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
-
-    session = get_session(args.user_agent)
-    ensure_data_dir(args.db)
-    conn = init_db(args.db)
-    # scrape category for product URLs
-    try:
-        product_links = scrape_category(session, args.start_url, args.max_pages)
-        logger.info("Collected %d product links", len(product_links))
-        for link in product_links:
-            try:
-                html = fetch(session, link)
-                item = parse_product_page(html, link)
-                upsert_listing(conn, item)
-            except Exception as e:
-                logger.exception("Error scraping product %s: %s", link, e)
-    except Exception as e:
-        logger.exception("Scraping failed: %s", e)
-        sys.exit(2)
-
-    if args.excel:
-        export_excel(conn, args.excel)
-
     conn.close()
+
+
+def export_to_excel(products: List[Dict[str, Optional[str]]], excel_path: str) -> None:
+    """Експортує всі зібрані товари до файлу Excel."""
+    os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+    df = pd.DataFrame(products)
+    df.to_excel(excel_path, index=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Novus/Zakaz.ua category scraper")
+    parser.add_argument("--db", default="data/novus_listings.db", help="Шлях до SQLite-бази")
+    parser.add_argument("--excel", default="data/novus_listings.xlsx", help="Шлях до Excel-файлу")
+    parser.add_argument("--progress", default="data/progress_novus.txt", help="Файл для прогресу")
+    parser.add_argument("--max-pages", type=int, default=None, help="Максимальна кількість сторінок")
+    args = parser.parse_args()
+
+    products = scrape_category(args.max_pages, args.progress)
+    save_to_db(products, args.db)
+    export_to_excel(products, args.excel)
+    logging.info(f"Зібрано {len(products)} товарів на Novus.")
 
 
 if __name__ == "__main__":
