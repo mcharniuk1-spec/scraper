@@ -1,0 +1,46 @@
+{
+  "sites": {
+    "fora": {
+      "name": "Fora.ua",
+      "base_url": "https://fora.ua/category/molochni-produkty-ta-iaitsia-2656",
+      "enabled": true,
+      "max_pages": 5,
+      "delay": 0.2,
+      "selectors": {
+        "product_cards": "div[class*='product-card']",
+        "title": "div[class*='product-card__title'], div[class*='product-card__name']",
+        "price": "span[class*='price']",
+        "link": "a[href]",
+        "page_title": "h1",
+        "description": "p[class*='product-description'], div[class*='product-description'], p"
+      }
+    },
+    "novus": {
+      "name": "Novus/Zakaz.ua",
+      "base_url": "https://novus.zakaz.ua/uk/categories/dairy-and-eggs/",
+      "enabled": true,
+      "max_pages": 10,
+      "delay": 0.1,
+      "selectors": {
+        "product_links": "a[href*='/uk/products/']",
+        "page_title": "h1",
+        "description": "p[class*='product-description'], div[data-testid='product-description'], p",
+        "image": "img[src^='https://']"
+      }
+    }
+  },
+  "database": {
+    "path": "data/unified_products.db",
+    "backup_enabled": true
+  },
+  "export": {
+    "excel_path": "data/unified_products.xlsx",
+    "progress_path": "data/unified_progress.txt"
+  },
+  "scraping": {
+    "request_timeout": 10,
+    "max_retries": 5,
+    "user_agent_rotation": true,
+    "session_renewal_interval": 50
+  }
+}
