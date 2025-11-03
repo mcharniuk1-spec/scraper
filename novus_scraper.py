@@ -101,43 +101,31 @@ def scrape_category(session: requests.Session, start_url: str, max_pages: int = 
 CURRENCY_RE = re.compile(r"(\d[\d\s,\.]*)\s*(₴|грн|uah|UAH)", re.IGNORECASE)
 
 
-def parse_product_page(html: str, url: str) -> Dict:
-    """Extract details from a product page."""
+def parse_product_page(session: requests.Session, url: str) -> Dict[str, Optional[str]]:
+    html = get_with_backoff(session, url)
     soup = BeautifulSoup(html, "lxml")
-    # title
-    title_tag = soup.find(["h1", "h2"])
-    title = title_tag.get_text(strip=True) if title_tag else None
-    # description from meta
-    description = None
-    meta_desc = soup.find("meta", attrs={"name": "description"})
-    if meta_desc and meta_desc.get("content"):
-        description = meta_desc["content"].strip()
-    # price detection
-    text_content = soup.get_text(" ", strip=True)
-    price = None
-    currency = None
-    m = CURRENCY_RE.search(text_content.replace("\xa0", " "))
-    if m:
-        num_str = m.group(1).replace(" ", "").replace(",", ".")
-        try:
-            price = float(num_str)
-        except ValueError:
-            price = None
-        currency = m.group(2)
-    # image (first image)
-    img_url = None
-    img = soup.find("img")
-    if img and img.get("src"):
-        img_url = requests.compat.urljoin(url, img.get("src"))
+    # Назва товару
+    title = soup.find("h1")
+    title_text = title.get_text(strip=True) if title else None
+    # Пошук ціни регулярним виразом
+    price_match = re.search(r"([0-9]+[,.]?[0-9]*)\s*₴", soup.get_text())
+    price = float(price_match.group(1).replace(",", ".")) if price_match else None
+    currency = "₴" if price_match else None
+    # Опис
+    desc_el = soup.find("p", class_="product-description") or soup.find("div", {"data-testid": "product-description"})
+    description = desc_el.get_text(strip=True) if desc_el else None
+    # Зображення
+    img_el = soup.find("img", {"data-testid": "product-image"})
+    img_url = img_el["src"] if img_el else None
     return {
-        "title": title,
-        "url": url,
-        "snippet": description,
-        "image_url": img_url,
+        "title": title_text,
         "price": price,
         "currency": currency,
-        "date_posted": None,
+        "description": description,
+        "image_url": img_url,
+        "url": url,
     }
+
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
