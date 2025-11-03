@@ -182,7 +182,7 @@ def main() -> None:
     parser.add_argument("--db", default="data/novus_listings.db", help="Шлях до SQLite-бази")
     parser.add_argument("--excel", default="data/novus_listings.xlsx", help="Шлях до Excel-файлу")
     parser.add_argument("--progress", default="data/novus_progress.txt", help="Файл для прогресу")
-    parser.add_argument("--max-pages", type=int, default=None,
+    parser.add_argument("--max-pages", type=int, default=10,10
                         help="Максимальна кількість сторінок для скрапінгу")
     args = parser.parse_args()
 
