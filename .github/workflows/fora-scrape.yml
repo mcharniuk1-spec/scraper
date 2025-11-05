@@ -1,0 +1,57 @@
+name: Automated Fora Scraping
+on:
+  schedule:
+    # 00:00 UTC і 12:00 UTC (два рази на добу ≈ кожні 12 годин)
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape-fora:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # установка браузера для Playwright
+          python -m playwright install chromium
+
+      - name: Create data directories
+        run: mkdir -p data/fora data/monitoring
+
+      - name: Run Fora scraper
+        run: |
+          python scripts/run_scraper.py \
+            --site fora \
+            --historical \
+            --max-pages 10 \
+            --config-dir config
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Generate monitoring reports
+        run: |
+          python scripts/health_monitor.py
+          python scripts/data_analyzer.py
+
+      - name: Commit and push results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Actions Bot"
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "📊 Automated Fora results - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          else
+            echo "No changes to commit"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
