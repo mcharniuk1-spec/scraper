@@ -1,8 +1,8 @@
-name: Scheduled Scraping
+name: Full Scraper
 
 on:
   schedule:
-    # Запускаємо кожні 12 годин (12:00 UTC та 00:00 UTC)
+    # Run every 12 hours (00:00 UTC and 12:00 UTC)
     - cron: '0 */12 * * *'
   workflow_dispatch:
     inputs:
