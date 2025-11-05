@@ -24,6 +24,7 @@ wheels/
 venv/
 ENV/
 env/
+.venv/
 
 # IDE
 .vscode/
@@ -32,12 +33,12 @@ env/
 *.swo
 *~
 
-# Database
-*.db
-*.sqlite
-*.sqlite3
+# Database (commented out - user wants to track all files)
+# *.db
+# *.sqlite
+# *.sqlite3
 
-# Data files (uncomment if you don't want to commit data)
+# Data files (tracking all files as requested)
 # data/*.db
 # data/*.xlsx
 # data/*.json

@@ -2,14 +2,22 @@ name: Scheduled Scraping
 
 on:
   schedule:
-    # Запускаємо кожні 12 годин
+    # Запускаємо кожні 12 годин (12:00 UTC та 00:00 UTC)
     - cron: '0 */12 * * *'
   workflow_dispatch:
+    inputs:
+      max_pages:
+        description: 'Maximum pages to scrape per site (0 = all pages)'
+        required: false
+        default: '0'
+        type: string
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write  # Allow workflow to commit results back to repo
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,30 +32,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Fora scraper
+      - name: Run all scrapers
         run: |
           mkdir -p data
-          python scripts/run_scraper.py --site fora --db data/listings.db
+          MAX_PAGES="${{ github.event.inputs.max_pages || '0' }}"
+          python scripts/run_all_scrapers.py --max-pages $MAX_PAGES --db data/listings.db --excel data/all_listings.xlsx || true
 
-      - name: Export Fora data and log progress
-        run: |
-          python scripts/analyze.py --db data/listings.db --site fora --export-excel data/fora_listings.xlsx
-          python scripts/monitor.py --db data/listings.db --site fora --log-progress
-
-      - name: Run Novus scraper
-        run: |
-          mkdir -p data
-          python scripts/run_scraper.py --site novus --db data/listings.db
-
-      - name: Export Novus data and log progress
-        run: |
-          python scripts/analyze.py --db data/listings.db --site novus --export-excel data/novus_listings.xlsx
-          python scripts/monitor.py --db data/listings.db --site novus --log-progress
-
-      - name: Commit scraped data
+      - name: Commit and push scraped data
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add data/*
-          git diff-index --quiet HEAD || git commit -m 'Update scraped data and progress logs'
-          git push
+          git add data/*.xlsx data/*.db 2>/dev/null || true
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Auto-scrape: Update listings data $(date +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          else
+            echo "No changes to commit"
+          fi
