@@ -2,7 +2,8 @@
 """
 Fora.ua Scraper
 
-Scrapes product listings from Fora.ua category pages.
+Scrapes product listings from Fora.ua category pages using Playwright
+for JavaScript rendering support.
 """
 import re
 from datetime import datetime
@@ -12,6 +13,12 @@ import requests
 from bs4 import BeautifulSoup
 
 import logging
+
+try:
+    from playwright.sync_api import sync_playwright, Browser, Page
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 from .base_scraper import BaseScraper
 
@@ -47,7 +54,7 @@ def normalize_price(text: str) -> Tuple[Optional[float], Optional[str]]:
 
 
 class ForaScraper(BaseScraper):
-    """Scraper for Fora.ua category pages."""
+    """Scraper for Fora.ua category pages using Playwright for JS rendering."""
 
     def __init__(self, **kwargs):
         """Initialize Fora scraper with default settings."""
@@ -59,6 +66,76 @@ class ForaScraper(BaseScraper):
         defaults.update(kwargs)
         super().__init__(**defaults)
         self.max_pages = 100  # Safety cap
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.warning(
+                "Playwright not available. Install with: pip install playwright && playwright install chromium"
+            )
+
+    def _init_browser(self):
+        """Initialize Playwright browser for JavaScript rendering."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ImportError(
+                "Playwright is required for Fora scraper. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
+        
+        if self.playwright is None:
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+            context = self.browser.new_context(
+                user_agent=self.user_agent,
+                viewport={'width': 1920, 'height': 1080}
+            )
+            self.page = context.new_page()
+            logger.debug("Playwright browser initialized")
+
+    def _close_browser(self):
+        """Close Playwright browser."""
+        if self.page:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            self.page = None
+        if self.browser:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+        if self.playwright:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
+
+    def fetch_with_playwright(self, url: str) -> str:
+        """
+        Fetch HTML content using Playwright for JavaScript rendering.
+        
+        Args:
+            url: URL to fetch
+            
+        Returns:
+            HTML content as string after JavaScript execution
+        """
+        if not self.page:
+            self._init_browser()
+        
+        logger.debug("Fetching with Playwright: %s", url)
+        self.page.goto(url, wait_until='networkidle', timeout=self.timeout * 1000)
+        # Wait a bit more for dynamic content
+        self.page.wait_for_timeout(2000)
+        html = self.page.content()
+        return html
 
     def find_pagination_next(self, soup: BeautifulSoup, current_url: str) -> Optional[str]:
         """Find next page URL from pagination links."""
@@ -67,6 +144,8 @@ class ForaScraper(BaseScraper):
             "a.next",
             "a.pagination__next",
             "li.next a",
+            'a[aria-label*="next"]',
+            'a[aria-label*="далі"]',
         ]
         for selector in selectors:
             found = soup.select_one(selector)
@@ -77,7 +156,7 @@ class ForaScraper(BaseScraper):
         for a in soup.find_all("a"):
             if a.string:
                 text = a.string.strip().lower()
-                if text in ("next", "далее", "вперёд", "вперед", "»", ">>"):
+                if text in ("next", "далее", "вперёд", "вперед", "далі", "»", ">>"):
                     if a.get("href"):
                         return requests.compat.urljoin(current_url, a["href"])
         return None
@@ -99,6 +178,8 @@ class ForaScraper(BaseScraper):
             "div.col-",
             "div[data-product]",
             "div[data-item]",
+            "[data-testid*='product']",
+            "[data-testid*='card']",
         ]
         found = []
         for selector in selectors:
@@ -200,6 +281,8 @@ class ForaScraper(BaseScraper):
         img = block.find("img")
         if img and img.get("src"):
             image = requests.compat.urljoin(base_url, img.get("src"))
+        elif img and img.get("data-src"):
+            image = requests.compat.urljoin(base_url, img.get("data-src"))
 
         # Price
         text_all = extract_text_from_tag(block)
@@ -233,122 +316,95 @@ class ForaScraper(BaseScraper):
             "date_posted": date_posted.isoformat() if date_posted else None,
         }
 
-    def _check_javascript_required(self, html: str, soup: BeautifulSoup) -> bool:
-        """Check if page requires JavaScript to render content."""
-        # Check for common JavaScript-required indicators
-        body_text = soup.body.get_text(strip=True).lower() if soup.body else ""
-        js_indicators = [
-            "you need to enable javascript",
-            "увімкніть javascript",
-            "необхідно увімкнути javascript",
-            "please enable javascript",
-            "noscript",
-        ]
-        
-        # Check HTML for React/SPA indicators
-        html_lower = html.lower()
-        spa_indicators = [
-            "react",
-            "__next__",
-            "reactroot",
-            "data-react",
-            "root",
-        ]
-        
-        # Check if body is mostly empty or has JavaScript requirement message
-        if any(indicator in body_text for indicator in js_indicators):
-            return True
-        
-        # Check if it's a React/SPA with minimal content
-        if any(indicator in html_lower for indicator in spa_indicators):
-            # If HTML is very short and has few links, likely JS-rendered
-            links_count = len(soup.find_all("a", href=True))
-            if len(html) < 15000 and links_count < 5:
-                return True
-        
-        return False
-
     def scrape(self, start_url: str, max_pages: int = 0) -> List[Dict]:
         """
-        Scrape category pages.
+        Scrape category pages using Playwright for JavaScript rendering.
 
         Args:
             start_url: Starting category URL
-            max_pages: Maximum pages to scrape (0 = no limit)
+            max_pages: Maximum pages to scrape (0 = no limit, uses config default)
 
         Returns:
             List of listing dictionaries
         """
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "Playwright is required for Fora scraper. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
+            return []
+
         if not self.is_allowed_by_robots(start_url):
             logger.warning("Scraping disallowed by robots.txt. Aborting.")
+            return []
+
+        # Initialize browser
+        try:
+            self._init_browser()
+        except Exception as e:
+            logger.exception("Failed to initialize Playwright browser: %s", e)
             return []
 
         results = []
         url = start_url
         page_count = 0
 
-        while url:
-            if 0 < max_pages <= page_count:
-                logger.info("Reached max pages (%s). Stopping.", max_pages)
-                break
-            if page_count >= self.max_pages:
-                logger.warning(
-                    "Reached safety MAX_PAGES (%s). Stopping.", self.max_pages
-                )
-                break
+        try:
+            while url:
+                if max_pages > 0 and page_count >= max_pages:
+                    logger.info("Reached max pages (%s). Stopping.", max_pages)
+                    break
+                if page_count >= self.max_pages:
+                    logger.warning(
+                        "Reached safety MAX_PAGES (%s). Stopping.", self.max_pages
+                    )
+                    break
 
-            try:
-                html = self.fetch(url)
-            except Exception as e:
-                logger.exception("Failed fetching page %s: %s", url, e)
-                break
+                try:
+                    html = self.fetch_with_playwright(url)
+                except Exception as e:
+                    logger.exception("Failed fetching page %s: %s", url, e)
+                    break
 
-            soup = self.parse_html(html)
-            
-            # Check if page requires JavaScript
-            if page_count == 0 and self._check_javascript_required(html, soup):
-                logger.error(
-                    "=" * 60 + "\n"
-                    "ERROR: Fora.ua requires JavaScript to render content.\n"
-                    "The page is a Single Page Application (SPA) that loads\n"
-                    "content dynamically via JavaScript.\n\n"
-                    "To scrape Fora.ua, you need to use a headless browser\n"
-                    "such as Selenium or Playwright instead of simple HTTP requests.\n\n"
-                    "Current solution: Consider using selenium-wire or playwright\n"
-                    "to render the page before scraping.\n"
-                    "=" * 60
-                )
-                logger.warning(
-                    "Skipping Fora scraper. Use --skip-fora to suppress this message."
-                )
-                return []
-            
-            blocks = self.extract_candidate_items(soup)
-            logger.info("Found %s candidate blocks on page %s", len(blocks), url)
+                soup = self.parse_html(html)
+                blocks = self.extract_candidate_items(soup)
+                logger.info("Found %s candidate blocks on page %d: %s", len(blocks), page_count + 1, url)
 
-            for block in blocks:
-                item = self.parse_item_block(block, self.base_url)
-                # Accept item if it has either URL or title (or both)
-                if item.get("url") is None and item.get("title") is None:
-                    continue
-                # Don't skip items with just URL but no title (might be valid products)
-                if item.get("url"):
-                    results.append(item)
-                    logger.debug(f"Added item: {item.get('title', 'No title')[:50]} - {item.get('url', 'No URL')[:60]}")
-                elif item.get("title"):
-                    # If no URL but has title, try to create URL from title or skip
-                    # For now, we'll include it but log it
-                    logger.debug(f"Item with title but no URL: {item.get('title')[:50]}")
-                    results.append(item)
+                for block in blocks:
+                    item = self.parse_item_block(block, self.base_url)
+                    # Accept item if it has either URL or title (or both)
+                    if item.get("url") is None and item.get("title") is None:
+                        continue
+                    # Don't skip items with just URL but no title (might be valid products)
+                    if item.get("url"):
+                        results.append(item)
+                        logger.debug(f"Added item: {item.get('title', 'No title')[:50]} - {item.get('url', 'No URL')[:60]}")
+                    elif item.get("title"):
+                        logger.debug(f"Item with title but no URL: {item.get('title')[:50]}")
+                        results.append(item)
 
-            page_count += 1
-            next_url = self.find_pagination_next(soup, url)
-            if not next_url:
-                logger.info("No next page found. Stopping after %d pages.", page_count)
-                break
-            if next_url == url:
-                logger.warning("Next URL equals current URL; stopping to avoid loop.")
-                break
-            url = next_url
+                page_count += 1
+                next_url = self.find_pagination_next(soup, url)
+                if not next_url:
+                    logger.info("No next page found. Stopping after %d pages.", page_count)
+                    break
+                if next_url == url:
+                    logger.warning("Next URL equals current URL; stopping to avoid loop.")
+                    break
+                url = next_url
+                
+                # Rate limiting between pages
+                import time
+                time.sleep(self.sleep_between_requests)
 
+        finally:
+            # Always close browser
+            self._close_browser()
+
+        logger.info("Scraped %d items from %d pages", len(results), page_count)
         return results
+
+    def cleanup(self):
+        """Clean up resources."""
+        self._close_browser()
+        super().cleanup()

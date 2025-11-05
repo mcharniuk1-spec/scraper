@@ -35,9 +35,54 @@ def load_config(config_path: str) -> dict:
         return json.load(f)
 
 
-def run_scraper(site: str, config_path: str, db_path: str, max_pages: int = 0):
-    """Run scraper for a specific site."""
+def run_fora_scraper(config_path: str, db_path: str, max_pages: int = 10):
+    """
+    Run Fora scraper specifically.
+    
+    Args:
+        config_path: Path to Fora config file
+        db_path: Path to database file
+        max_pages: Maximum pages to scrape (default: 10)
+    
+    Returns:
+        Number of items scraped
+    """
+    return run_scraper("fora", config_path, db_path, max_pages)
+
+
+def run_novus_scraper(config_path: str, db_path: str, max_pages: int = 10):
+    """
+    Run Novus scraper specifically.
+    
+    Args:
+        config_path: Path to Novus config file
+        db_path: Path to database file
+        max_pages: Maximum pages to scrape (default: 10)
+    
+    Returns:
+        Number of items scraped
+    """
+    return run_scraper("novus", config_path, db_path, max_pages)
+
+
+def run_scraper(site: str, config_path: str, db_path: str, max_pages: int = 10):
+    """
+    Run scraper for a specific site.
+    
+    Args:
+        site: Site identifier ('fora' or 'novus')
+        config_path: Path to config file
+        db_path: Path to database file
+        max_pages: Maximum pages to scrape (default: 10, 0 = no limit)
+    
+    Returns:
+        Number of items scraped
+    """
     config = load_config(config_path)
+    
+    # If max_pages is 0, use config default or 10
+    if max_pages == 0:
+        max_pages = config.get("max_pages", 10)
     
     scraper_class = {"fora": ForaScraper, "novus": NovusScraper}.get(site.lower())
     if not scraper_class:
@@ -53,7 +98,7 @@ def run_scraper(site: str, config_path: str, db_path: str, max_pages: int = 0):
     )
 
     try:
-        logger.info("Starting scraper for %s", site)
+        logger.info("Starting scraper for %s (max_pages: %d)", site, max_pages)
         start_url = config.get("start_url")
         results = scraper.scrape(start_url, max_pages=max_pages)
         logger.info("Scraped %d items from %s", len(results), site)
@@ -107,8 +152,8 @@ def main():
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=0,
-        help="Maximum pages to scrape per site (0 = no limit)",
+        default=10,
+        help="Maximum pages to scrape per site (default: 10, 0 = no limit)",
     )
     parser.add_argument(
         "--db",
@@ -156,14 +201,17 @@ def main():
     total_products = 0
     scraper_errors = []
     
+    # Use provided max_pages (default is 10, 0 means use config default)
+    max_pages = args.max_pages
+    
     # Run Fora scraper
     if not args.skip_fora:
         fora_config = os.path.join(script_dir, "config", "fora.json")
         if os.path.exists(fora_config):
-            products = run_scraper("fora", fora_config, args.db, args.max_pages)
+            products = run_fora_scraper(fora_config, args.db, max_pages)
             total_products += products
             if products == 0:
-                scraper_errors.append("Fora scraper found 0 items (may require JavaScript rendering)")
+                scraper_errors.append("Fora scraper found 0 items")
         else:
             logger.warning("Fora config not found: %s", fora_config)
             scraper_errors.append(f"Fora config not found: {fora_config}")
@@ -174,7 +222,7 @@ def main():
     if not args.skip_novus:
         novus_config = os.path.join(script_dir, "config", "novus.json")
         if os.path.exists(novus_config):
-            products = run_scraper("novus", novus_config, args.db, args.max_pages)
+            products = run_novus_scraper(novus_config, args.db, max_pages)
             total_products += products
         else:
             logger.warning("Novus config not found: %s", novus_config)

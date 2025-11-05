@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       max_pages:
-        description: 'Maximum pages to scrape per site (0 = all pages)'
+        description: 'Maximum pages to scrape per site (default: 10, 0 = all pages)'
         required: false
-        default: '0'
+        default: '10'
         type: string
 
 jobs:
@@ -32,10 +32,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Playwright browsers
+        run: |
+          playwright install chromium
+          playwright install-deps chromium || true
+
       - name: Run all scrapers
         run: |
           mkdir -p data
-          MAX_PAGES="${{ github.event.inputs.max_pages || '0' }}"
+          MAX_PAGES="${{ github.event.inputs.max_pages || '10' }}"
           python scripts/run_all_scrapers.py --max-pages $MAX_PAGES --db data/listings.db --excel data/all_listings.xlsx || true
 
       - name: Commit and push scraped data
