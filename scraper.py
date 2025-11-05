@@ -1,411 +1,210 @@
 #!/usr/bin/env python3
 """
-Fora.ua category scraper
+Скрапер для категорії «Молочні продукти та яйця» на Fora.ua.
 
-Stores results into a local SQLite DB (data/fora_listings.db) by default.
-Respects robots.txt, uses retries/backoff, and de-duplicates by URL.
+- Збирає назву, повну назву, ціну, валюту, опис та URL товару.
+- Підтримує інкрементальне оновлення бази даних (URL — унікальний ключ).
+- Експортує результати у SQLite та Excel.
+- Веде текстовий лог прогресу.
+
+Запуск:
+    python scraper.py --db data/fora_listings.db \
+                      --excel data/fora_listings.xlsx \
+                      --progress data/fora_progress.txt \
+                      --max-pages 3
 """
+
 import argparse
-import json
 import logging
 import os
 import re
 import sqlite3
-import sys
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+
 import backoff
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from dateutil import parser as dateparser
 
-# Configuration
 BASE_CATEGORY_URL = "https://fora.ua/category/molochni-produkty-ta-iaitsia-2656"
-DEFAULT_DB_PATH = os.path.join("data", "fora_listings.db")
-USER_AGENT = "fora-scraper/1.0 (+https://github.com/yourname/fora-scraper) Python-requests"
-REQUESTS_TIMEOUT = 20  # seconds
-SLEEP_BETWEEN_PAGES = 1.0  # polite pause between page fetches
-MAX_PAGES = 100  # safety cap if pagination loop misbehaves
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/118.0.0.0 Safari/537.36"
+)
 
-logger = logging.getLogger("fora_scraper")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-def ensure_data_dir(db_path: str) -> None:
-    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-def get_session(user_agent: str = USER_AGENT) -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": user_agent, "Accept-Language": "en-US,en;q=0.9"})
-    # Requests Retry via urllib3
-    adapter = requests.adapters.HTTPAdapter(
-        max_retries=requests.adapters.Retry(
-            total=5,
-            backoff_factor=0.8,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=frozenset(["GET", "HEAD"])
-        )
-    )
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
+def log_progress(progress_path: str, message: str) -> None:
+    os.makedirs(os.path.dirname(progress_path), exist_ok=True)
+    with open(progress_path, "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
 
 
-def is_allowed_by_robots(session: requests.Session, url: str, user_agent: str = "*") -> bool:
-    # Basic robots.txt check
-    try:
-        parsed = requests.utils.urlparse(url)
-        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-        r = session.get(robots_url, timeout=REQUESTS_TIMEOUT)
-        if r.status_code != 200:
-            logger.debug("robots.txt not found or returned %s; proceeding", r.status_code)
-            return True
-        lines = r.text.splitlines()
-        allow = True
-        ua = None
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.lower().startswith("user-agent:"):
-                ua = line.split(":", 1)[1].strip()
-            elif ua and (ua == "*" or user_agent.lower().startswith(ua.lower())):
-                if line.lower().startswith("disallow:"):
-                    path = line.split(":", 1)[1].strip()
-                    if path and parsed.path.startswith(path):
-                        allow = False
-                        logger.info("Blocked by robots.txt: %s", path)
-                        return False
-        return allow
-    except Exception as e:
-        logger.warning("Failed to check robots.txt: %s. Proceeding cautiously.", e)
-        return True
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
 
 
-@backoff.on_exception(backoff.expo, (requests.exceptions.RequestException,), max_time=60)
+@backoff.on_exception(backoff.expo, requests.exceptions.RequestException, max_tries=5)
 def fetch(session: requests.Session, url: str) -> str:
-    logger.info("Fetching %s", url)
-    r = session.get(url, timeout=REQUESTS_TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    resp = session.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.text
 
 
-def find_pagination_next(soup: BeautifulSoup) -> Optional[str]:
-    # Common patterns for next page links
-    selectors = [
-        'a[rel="next"]',
-        "a.next",
-        "a.pagination__next",
-        "li.next a",
-        "a:contains('>>')",
-    ]
-    # BeautifulSoup doesn't support :contains easily; we'll do custom fallback
-    for s in selectors:
-        found = soup.select_one(s)
-        if found and found.get("href"):
-            return requests.compat.urljoin(BASE_CATEGORY_URL, found["href"])
-    # Fallback: link text
-    for a in soup.find_all("a"):
-        if a.string:
-            text = a.string.strip().lower()
-            if text in ("next", "далее", "вперёд", "вперед", "»", ">>"):
-                if a.get("href"):
-                    return requests.compat.urljoin(BASE_CATEGORY_URL, a["href"])
-    return None
-
-
-def extract_candidate_items(soup: BeautifulSoup) -> List[BeautifulSoup]:
-    # Try multiple heuristics for finding item blocks
-    selectors = [
-        "article",
-        "div.post",
-        "div.post-item",
-        "div.card",
-        "div.product-item",
-        "div.listing-item",
-        "li.item",
-        "div.col-",
-    ]
-    found = []
-    for sel in selectors:
-        found.extend(soup.select(sel))
-    # fallback: find all links inside the main content area
-    if not found:
-        main = soup.find("main") or soup.find(id="content") or soup.body
-        if main:
-            found = [tag for tag in main.find_all("div", recursive=False) if tag.find("a")]
-    # Deduplicate by object id
-    unique = []
-    seen = set()
-    for f in found:
-        key = str(f)[:300]  # coarse dedup
-        if key not in seen:
-            unique.append(f)
-            seen.add(key)
-    return unique
-
-
-CURRENCY_RE = re.compile(r"(\d[\d\s,\.]*)\s*(грн|uah|UAH|₴)?", re.IGNORECASE)
-
-
-def extract_text_from_tag(tag):
-    if not tag:
-        return ""
-    return " ".join(tag.stripped_strings)
-
-
-def normalize_price(text: str) -> Tuple[Optional[float], Optional[str]]:
-    if not text:
-        return None, None
-    m = CURRENCY_RE.search(text.replace("\xa0", " "))
-    if not m:
-        return None, None
-    num = m.group(1)
-    # Normalize number: remove spaces, replace comma with dot, remove thousands separators
-    num = num.replace(" ", "").replace(",", ".")
-    try:
-        price = float(num)
-    except ValueError:
-        price = None
-    currency = m.group(2) if m.group(2) else None
-    return price, currency
-
-
-def parse_item_block(block: BeautifulSoup) -> Dict:
-    # Try to extract title and link
-    title = None
-    link = None
-    image = None
-    snippet = None
+def parse_item_block(block: BeautifulSoup) -> Dict[str, Optional[str]]:
+    title_el = block.find("div", class_=re.compile(r"(product-card__title|product-card__name)"))
+    title = title_el.get_text(strip=True) if title_el else None
+    link_el = block.find("a", href=True)
+    url = "https://fora.ua" + link_el["href"] if link_el else None
     price = None
     currency = None
-    date_posted = None
-
-    # first look for link + title
-    a = block.find("a", href=True)
-    if a:
-        link = requests.compat.urljoin(BASE_CATEGORY_URL, a["href"])
-        # prefer inner header tags
-        header = a.find(["h1", "h2", "h3", "h4"])
-        if header:
-            title = extract_text_from_tag(header)
-        else:
-            # fallback: a's text
-            title = extract_text_from_tag(a)
-
-    # title fallback: header elements not within <a>
-    if not title:
-        header = block.find(["h1", "h2", "h3", "h4"])
-        if header:
-            title = extract_text_from_tag(header)
-
-    # snippet / description
-    p = block.find("p")
-    if p:
-        snippet = extract_text_from_tag(p)
-
-    # image
-    img = block.find("img")
-    if img and img.get("src"):
-        image = requests.compat.urljoin(BASE_CATEGORY_URL, img.get("src"))
-
-    # price detection: search inside block for patterns like "грн" or numbers
-    text_all = extract_text_from_tag(block)
-    price_val, currency_val = normalize_price(text_all)
-    if price_val:
-        price = price_val
-        currency = currency_val
-
-    # date: try time/abbr or patterns
-    time_tag = block.find("time")
-    if time_tag and time_tag.get("datetime"):
-        try:
-            date_posted = dateparser.parse(time_tag["datetime"])
-        except Exception:
-            date_posted = None
-    else:
-        # look for date-like text
-        date_match = re.search(r"\b(\d{1,2}\.\d{1,2}\.\d{2,4})\b", text_all)
-        if date_match:
-            try:
-                date_posted = dateparser.parse(date_match.group(1), dayfirst=True)
-            except Exception:
-                date_posted = None
-
+    price_el = block.find("span", class_=re.compile(r"price"))
+    if price_el:
+        text = price_el.get_text(strip=True)
+        match = re.search(r"([\d,.]+)\s*₴", text)
+        if match:
+            price = float(match.group(1).replace(",", "."))
+            currency = "₴"
     return {
-        "title": title.strip() if title else None,
-        "url": link,
-        "snippet": snippet.strip() if snippet else None,
-        "image_url": image,
+        "title": title,
+        "full_name": None,
         "price": price,
         "currency": currency,
-        "date_posted": date_posted.isoformat() if date_posted else None,
+        "description": None,
+        "url": url,
     }
 
 
-def init_db(db_path: str) -> sqlite3.Connection:
-    ensure_data_dir(db_path)
-    conn = sqlite3.connect(db_path, check_same_thread=False)
+def parse_product_page(session: requests.Session, url: str) -> Dict[str, Optional[str]]:
+    html = fetch(session, url)
+    soup = BeautifulSoup(html, "lxml")
+    full_name = None
+    description = None
+    price = None
+    currency = None
+
+    name_el = soup.find("h1")
+    if name_el:
+        full_name = name_el.get_text(strip=True)
+    desc_el = (
+        soup.find("p", class_=re.compile("product-description"))
+        or soup.find("div", class_=re.compile("product-description"))
+        or soup.find("p")
+    )
+    if desc_el:
+        description = desc_el.get_text(strip=True)
+    page_text = soup.get_text(" ", strip=True)
+    match = re.search(r"([\d,.]+)\s*₴", page_text)
+    if match:
+        price = float(match.group(1).replace(",", "."))
+        currency = "₴"
+    return {
+        "full_name": full_name,
+        "description": description,
+        "price": price,
+        "currency": currency,
+    }
+
+
+def scrape_category(max_pages: Optional[int], progress_path: str) -> List[Dict[str, Optional[str]]]:
+    session = get_session()
+    products: List[Dict[str, Optional[str]]] = []
+    page_num = 1
+    while True:
+        url = BASE_CATEGORY_URL + (f"?page={page_num}" if page_num > 1 else "")
+        logging.info(f"Завантаження сторінки {page_num}: {url}")
+        log_progress(progress_path, f"Категорія: сторінка {page_num} ({url})")
+        try:
+            html = fetch(session, url)
+        except requests.HTTPError as e:
+            logging.error(f"Помилка завантаження {url}: {e}")
+            break
+        soup = BeautifulSoup(html, "lxml")
+        blocks = soup.find_all("div", class_=re.compile(r"product-card"))
+        if not blocks:
+            logging.info("На сторінці немає товарних карточок. Завершення.")
+            break
+        for block in blocks:
+            item = parse_item_block(block)
+            if (item["full_name"] is None or item["price"] is None) and item["url"]:
+                try:
+                    extra = parse_product_page(session, item["url"])
+                    for key, value in extra.items():
+                        if item.get(key) in (None, "") and value:
+                            item[key] = value
+                except requests.HTTPError as e:
+                    logging.error(f"Помилка завантаження товару {item['url']}: {e}")
+            products.append(item)
+            log_progress(progress_path, f"Отримано товар: {item['title']} ({item['url']})")
+            time.sleep(0.2)
+        page_num += 1
+        if max_pages is not None and page_num > max_pages:
+            break
+    return products
+
+
+def save_to_db(products: List[Dict[str, Optional[str]]], db_path: str) -> None:
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS listings (
+        CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE,
             title TEXT,
-            snippet TEXT,
-            image_url TEXT,
+            full_name TEXT,
             price REAL,
             currency TEXT,
-            date_posted TEXT,
-            scraped_at TEXT
+            description TEXT,
+            url TEXT UNIQUE
         )
-    """
+        """
     )
-    conn.commit()
-    return conn
-
-
-def upsert_listing(conn: sqlite3.Connection, item: Dict) -> None:
-    cur = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
-    try:
+    for prod in products:
         cur.execute(
             """
-            INSERT INTO listings (url, title, snippet, image_url, price, currency, date_posted, scraped_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(url) DO UPDATE SET
-              title=excluded.title,
-              snippet=excluded.snippet,
-              image_url=excluded.image_url,
-              price=excluded.price,
-              currency=excluded.currency,
-              date_posted=excluded.date_posted,
-              scraped_at=excluded.scraped_at
+            INSERT OR REPLACE INTO products
+            (title, full_name, price, currency, description, url)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                item.get("url"),
-                item.get("title"),
-                item.get("snippet"),
-                item.get("image_url"),
-                item.get("price"),
-                item.get("currency"),
-                item.get("date_posted"),
-                now,
+                prod.get("title"),
+                prod.get("full_name"),
+                prod.get("price"),
+                prod.get("currency"),
+                prod.get("description"),
+                prod.get("url"),
             ),
         )
-    except sqlite3.Error as e:
-        logger.exception("DB insert failed for %s: %s", item.get("url"), e)
     conn.commit()
-
-
-def scrape_category(start_url: str, conn: sqlite3.Connection, max_pages: int = 0, session: Optional[requests.Session] = None) -> List[Dict]:
-    if session is None:
-        session = get_session()
-    if not is_allowed_by_robots(session, start_url):
-        raise SystemExit("Scraping disallowed by robots.txt. Aborting.")
-
-    results = []
-    url = start_url
-    page_count = 0
-    while url:
-        if 0 < max_pages <= page_count:
-            logger.info("Reached max pages (%s). Stopping.", max_pages)
-            break
-        if page_count >= MAX_PAGES:
-            logger.warning("Reached safety MAX_PAGES (%s). Stopping.", MAX_PAGES)
-            break
-        try:
-            html = fetch(session, url)
-        except Exception as e:
-            logger.exception("Failed fetching page %s: %s", url, e)
-            break
-        soup = BeautifulSoup(html, "lxml")
-        blocks = extract_candidate_items(soup)
-        logger.info("Found %s candidate blocks on page %s", len(blocks), url)
-        for b in blocks:
-            item = parse_item_block(b)
-            if item.get("url") is None and item.get("title") is None:
-                # skip useless blocks
-                continue
-            # if url missing, try to create a synthetic slug from title
-            upsert_listing(conn, item)
-            results.append(item)
-        page_count += 1
-        next_url = find_pagination_next(soup)
-        if not next_url:
-            logger.info("No next page found. Stopping after %d pages.", page_count)
-            break
-        if next_url == url:
-            logger.warning("Next URL equals current URL; stopping to avoid loop.")
-            break
-        url = next_url
-        time.sleep(SLEEP_BETWEEN_PAGES)
-    return results
-
-
-def export_json(conn: sqlite3.Connection, path: str) -> None:
-    cur = conn.cursor()
-    cur.execute("SELECT url, title, snippet, image_url, price, currency, date_posted, scraped_at FROM listings ORDER BY scraped_at DESC")
-    rows = cur.fetchall()
-    keys = ["url", "title", "snippet", "image_url", "price", "currency", "date_posted", "scraped_at"]
-    out = [dict(zip(keys, r)) for r in rows]
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
-    logger.info("Exported %d rows to %s", len(out), path)
-
-
-def export_csv(conn: sqlite3.Connection, path: str) -> None:
-    import csv
-    cur = conn.cursor()
-    cur.execute("SELECT url, title, snippet, image_url, price, currency, date_posted, scraped_at FROM listings ORDER BY scraped_at DESC")
-    rows = cur.fetchall()
-    keys = ["url", "title", "snippet", "image_url", "price", "currency", "date_posted", "scraped_at"]
-    with open(path, "w", encoding="utf-8', newline='") as f:  # noqa: W605
-        writer = csv.writer(f)
-        writer.writerow(keys)
-        writer.writerows(rows)
-    logger.info("Exported %d rows to %s", len(rows), path)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Fora.ua category scraper")
-    p.add_argument("--start-url", default=BASE_CATEGORY_URL)
-    p.add_argument("--db", default=DEFAULT_DB_PATH)
-    p.add_argument("--json", help="Export JSON file path after scraping")
-    p.add_argument("--csv", help="Export CSV file path after scraping")
-    p.add_argument("--max-pages", type=int, default=0, help="Max pages to fetch (0 = no limit)")
-    p.add_argument("--user-agent", default=USER_AGENT)
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
-
-    session = get_session(args.user_agent)
-    ensure_data_dir(args.db)
-    conn = init_db(args.db)
-
-    try:
-        results = scrape_category(args.start_url, conn, max_pages=args.max_pages, session=session)
-        logger.info("Scraped total items: %d", len(results))
-    except SystemExit as e:
-        logger.error("Aborted: %s", e)
-        sys.exit(1)
-    except Exception as e:
-        logger.exception("Scraping failed: %s", e)
-        sys.exit(2)
-
-    if args.json:
-        export_json(conn, args.json)
-    if args.csv:
-        export_csv(conn, args.csv)
     conn.close()
+
+
+def export_to_excel(products: List[Dict[str, Optional[str]]], excel_path: str) -> None:
+    os.makedirs(os.path.dirname(excel_path), exist_ok=True)
+    df = pd.DataFrame(products)
+    df.to_excel(excel_path, index=False)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fora.ua category scraper")
+    parser.add_argument("--db", default="data/fora_listings.db", help="Шлях до SQLite-бази")
+    parser.add_argument("--excel", default="data/fora_listings.xlsx", help="Шлях до Excel-файлу")
+    parser.add_argument("--progress", default="data/fora_progress.txt", help="Файл для прогресу")
+    parser.add_argument("--max-pages", type=int, default=None,
+                        help="Максимальна кількість сторінок")
+    args = parser.parse_args()
+
+    products = scrape_category(args.max_pages, args.progress)
+    save_to_db(products, args.db)
+    export_to_excel(products, args.excel)
+    logging.info(f"Зібрано {len(products)} товарів.")
 
 
 if __name__ == "__main__":
