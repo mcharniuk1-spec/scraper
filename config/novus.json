@@ -1,0 +1,11 @@
+{
+  "base_url": "https://novus.zakaz.ua",
+  "start_url": "https://novus.zakaz.ua/uk/categories/dairy-and-eggs/",
+  "user_agent": "novus-scraper/1.0 (+https://github.com/yourname/novus-scraper) Python-requests",
+  "timeout": 20,
+  "sleep_between_requests": 0.5,
+  "max_retries": 5,
+  "max_pages": 0,
+  "site": "novus",
+  "category": "dairy-and-eggs"
+}

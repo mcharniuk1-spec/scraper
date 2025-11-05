@@ -24,107 +24,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Надійний запуск Fora‑скрапера: перевіряємо кілька можливих шляхів
       - name: Run Fora scraper
         run: |
           mkdir -p data
-          # possible locations: root scraper.py, or scraper/scraper.py
-          if [ -f "./scraper.py" ]; then
-            echo "Found ./scraper.py — running it"
-            python ./scraper.py --db data/fora_listings.db
-          elif [ -f "./scraper/scraper.py" ]; then
-            echo "Found ./scraper/scraper.py — running it"
-            python ./scraper/scraper.py --db data/fora_listings.db
-          else
-            echo "Error: Fora scraper not found (checked ./scraper.py and ./scraper/scraper.py)" >&2
-            ls -la
-            exit 2
-          fi
+          python scripts/run_scraper.py --site fora --db data/listings.db
 
-      # Конвертація Fora‑БД у Excel та запис прогресу
-      - name: Export Fora DB to Excel and log progress
+      - name: Export Fora data and log progress
         run: |
-          python - <<'PY'
-          import sqlite3, pandas as pd
-          from datetime import datetime, timezone
-          import os
+          python scripts/analyze.py --db data/listings.db --site fora --export-excel data/fora_listings.xlsx
+          python scripts/monitor.py --db data/listings.db --site fora --log-progress
 
-          db_path = 'data/fora_listings.db'
-          excel_path = 'data/fora_listings.xlsx'
-          progress_path = 'data/fora_progress.txt'
-
-          if not os.path.exists(db_path):
-              print("DB not found:", db_path)
-          else:
-              conn = sqlite3.connect(db_path)
-              cur = conn.cursor()
-              try:
-                  cur.execute("SELECT COUNT(*) FROM listings")
-                  count = cur.fetchone()[0]
-              except Exception:
-                  count = 0
-              try:
-                  df = pd.read_sql_query(
-                      "SELECT url, title, snippet, image_url, price, currency, date_posted, scraped_at "
-                      "FROM listings ORDER BY scraped_at DESC",
-                      conn
-                  )
-                  df.to_excel(excel_path, index=False)
-              except Exception as e:
-                  print('Export to Excel failed:', e)
-              with open(progress_path, 'a', encoding='utf-8') as f:
-                  ts = datetime.now(timezone.utc).isoformat()
-                  f.write(f"{ts}\t{count}\n")
-              conn.close()
-          PY
-
-      # Запуск Novus‑скрапера — також надійний запуск (перевіряємо кілька шляхів)
       - name: Run Novus scraper
         run: |
           mkdir -p data
-          if [ -f "./novus_scraper.py" ]; then
-            echo "Found ./novus_scraper.py — running it"
-            python ./novus_scraper.py --db data/novus_listings.db --excel data/novus_listings.xlsx
-          elif [ -f "./scraper/novus_scraper.py" ]; then
-            echo "Found ./scraper/novus_scraper.py — running it"
-            python ./scraper/novus_scraper.py --db data/novus_listings.db --excel data/novus_listings.xlsx
-          else
-            echo "Warning: Novus scraper not found (checked ./novus_scraper.py and ./scraper/novus_scraper.py). Skipping." >&2
-          fi
+          python scripts/run_scraper.py --site novus --db data/listings.db
 
-      # Запис прогресу для Novus
-      - name: Log progress for Novus
+      - name: Export Novus data and log progress
         run: |
-          python - <<'PY'
-          import sqlite3, os
-          from datetime import datetime, timezone
+          python scripts/analyze.py --db data/listings.db --site novus --export-excel data/novus_listings.xlsx
+          python scripts/monitor.py --db data/listings.db --site novus --log-progress
 
-          db_path = 'data/novus_listings.db'
-          progress_path = 'data/novus_progress.txt'
-
-          if os.path.exists(db_path):
-              try:
-                  conn = sqlite3.connect(db_path)
-                  cur = conn.cursor()
-                  cur.execute("SELECT COUNT(*) FROM listings")
-                  count = cur.fetchone()[0]
-                  conn.close()
-              except Exception:
-                  count = 0
-          else:
-              count = 0
-
-          with open(progress_path, 'a', encoding='utf-8') as f:
-              ts = datetime.now(timezone.utc).isoformat()
-              f.write(f"{ts}\t{count}\n")
-          PY
-
-      # Коміт результатів та журналів у репозиторій
       - name: Commit scraped data
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add data/*
-          # Коміт відбувається лише за наявності змін
           git diff-index --quiet HEAD || git commit -m 'Update scraped data and progress logs'
           git push
