@@ -1,36 +1,410 @@
-from src.core.scraper_base import BaseScraper
-from src.core.database import DatabaseManager
+#!/usr/bin/env python3
+"""
+Fora.ua Scraper
+
+Scrapes product listings from Fora.ua category pages using Playwright
+for JavaScript rendering support.
+"""
+import re
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+from dateutil import parser as dateparser
+import requests
 from bs4 import BeautifulSoup
 
-class ForaScraper(BaseScraper):
-    def scrape(self, start_url, max_pages=0):
-        records, page = [], 1
-        while True:
-            html = self.fetch(f"{start_url}?page={page}")
-            soup = self.parse_html(html)
-            items = soup.select(".product-card__content")
-            if not items:
-                break
-            for it in items:
-                title = it.select_one(".product-card__title").get_text(strip=True)
-                price_tag = it.select_one(".product-card__price-current")
-                price = float(price_tag.text.split()[0].replace(",", ".")) if price_tag else 0.0
-                link = it.select_one("a")["href"]
-                records.append({
-                    "title": title,
-                    "price": price,
-                    "url": f"https://fora.ua{link}"
-                })
-            if max_pages and page >= max_pages:
-                break
-            page += 1
-            self.delay()
-        return records
+import logging
 
-def run_fora(config):
-    scraper = ForaScraper(**config)
-    data = scraper.scrape(config["start_url"], config.get("max_pages", 0))
-    db = DatabaseManager("data/fora_history.db")
-    db.init_db()
-    db.save_records("fora", data)
-    db.export_to_excel("data/exports/fora_listings.xlsx")
+try:
+    from playwright.sync_api import sync_playwright, Browser, Page
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+from .base_scraper import BaseScraper
+
+logger = logging.getLogger(__name__)
+
+# Price pattern matching
+CURRENCY_RE = re.compile(r"(\d[\d\s,\.]*)\s*(грн|uah|UAH|₴)?", re.IGNORECASE)
+
+
+def extract_text_from_tag(tag) -> str:
+    """Extract text from a BeautifulSoup tag."""
+    if not tag:
+        return ""
+    return " ".join(tag.stripped_strings)
+
+
+def normalize_price(text: str) -> Tuple[Optional[float], Optional[str]]:
+    """Normalize price string to float value and currency."""
+    if not text:
+        return None, None
+    m = CURRENCY_RE.search(text.replace("\xa0", " "))
+    if not m:
+        return None, None
+    num = m.group(1)
+    # Normalize number: remove spaces, replace comma with dot
+    num = num.replace(" ", "").replace(",", ".")
+    try:
+        price = float(num)
+    except ValueError:
+        price = None
+    currency = m.group(2) if m.group(2) else None
+    return price, currency
+
+
+class ForaScraper(BaseScraper):
+    """Scraper for Fora.ua category pages using Playwright for JS rendering."""
+
+    def __init__(self, **kwargs):
+        """Initialize Fora scraper with default settings."""
+        defaults = {
+            "base_url": "https://fora.ua",
+            "user_agent": "fora-scraper/1.0 (+https://github.com/yourname/fora-scraper) Python-requests",
+            "sleep_between_requests": 1.0,
+        }
+        defaults.update(kwargs)
+        super().__init__(**defaults)
+        self.max_pages = 100  # Safety cap
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.warning(
+                "Playwright not available. Install with: pip install playwright && playwright install chromium"
+            )
+
+    def _init_browser(self):
+        """Initialize Playwright browser for JavaScript rendering."""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ImportError(
+                "Playwright is required for Fora scraper. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
+        
+        if self.playwright is None:
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+            context = self.browser.new_context(
+                user_agent=self.user_agent,
+                viewport={'width': 1920, 'height': 1080}
+            )
+            self.page = context.new_page()
+            logger.debug("Playwright browser initialized")
+
+    def _close_browser(self):
+        """Close Playwright browser."""
+        if self.page:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            self.page = None
+        if self.browser:
+            try:
+                self.browser.close()
+            except Exception:
+                pass
+            self.browser = None
+        if self.playwright:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+            self.playwright = None
+
+    def fetch_with_playwright(self, url: str) -> str:
+        """
+        Fetch HTML content using Playwright for JavaScript rendering.
+        
+        Args:
+            url: URL to fetch
+            
+        Returns:
+            HTML content as string after JavaScript execution
+        """
+        if not self.page:
+            self._init_browser()
+        
+        logger.debug("Fetching with Playwright: %s", url)
+        self.page.goto(url, wait_until='networkidle', timeout=self.timeout * 1000)
+        # Wait a bit more for dynamic content
+        self.page.wait_for_timeout(2000)
+        html = self.page.content()
+        return html
+
+    def find_pagination_next(self, soup: BeautifulSoup, current_url: str) -> Optional[str]:
+        """Find next page URL from pagination links."""
+        selectors = [
+            'a[rel="next"]',
+            "a.next",
+            "a.pagination__next",
+            "li.next a",
+            'a[aria-label*="next"]',
+            'a[aria-label*="далі"]',
+        ]
+        for selector in selectors:
+            found = soup.select_one(selector)
+            if found and found.get("href"):
+                return requests.compat.urljoin(current_url, found["href"])
+
+        # Fallback: search by link text
+        for a in soup.find_all("a"):
+            if a.string:
+                text = a.string.strip().lower()
+                if text in ("next", "далее", "вперёд", "вперед", "далі", "»", ">>"):
+                    if a.get("href"):
+                        return requests.compat.urljoin(current_url, a["href"])
+        return None
+
+    def extract_candidate_items(self, soup: BeautifulSoup) -> List[BeautifulSoup]:
+        """Extract candidate item blocks from page."""
+        selectors = [
+            "article",
+            "div.post",
+            "div.post-item",
+            "div.card",
+            "div.product-item",
+            "div.listing-item",
+            "li.item",
+            "div[class*='product']",
+            "div[class*='item']",
+            "div[class*='card']",
+            "div[class*='post']",
+            "div.col-",
+            "div[data-product]",
+            "div[data-item]",
+            "[data-testid*='product']",
+            "[data-testid*='card']",
+        ]
+        found = []
+        for selector in selectors:
+            try:
+                items = soup.select(selector)
+                found.extend(items)
+            except Exception:
+                continue
+
+        # More aggressive fallback: find all links with product-like patterns
+        if not found or len(found) < 3:
+            main = soup.find("main") or soup.find(id="content") or soup.find("div", class_="content") or soup.body
+            if main:
+                # Look for divs containing links that might be products
+                links = main.find_all("a", href=True)
+                for link in links:
+                    href = link.get("href", "")
+                    # Check if link looks like a product/category link
+                    if any(keyword in href.lower() for keyword in ["product", "item", "goods", "category", "offer", "/p/", "/prod"]):
+                        # Find parent container
+                        parent = link.find_parent(["div", "article", "li"])
+                        if parent and parent not in found:
+                            found.append(parent)
+
+        # Another fallback: find divs with links and some content
+        if not found or len(found) < 3:
+            main = soup.find("main") or soup.find(id="content") or soup.body
+            if main:
+                divs = main.find_all("div", recursive=True)
+                for div in divs:
+                    # Check if div has a link and some text content
+                    if div.find("a", href=True) and len(div.get_text(strip=True)) > 20:
+                        # Avoid very large containers
+                        if len(div.get_text(strip=True)) < 5000:
+                            found.append(div)
+
+        # Deduplicate
+        unique = []
+        seen = set()
+        for f in found:
+            key = str(f)[:300]
+            if key not in seen:
+                unique.append(f)
+                seen.add(key)
+        
+        logger.debug(f"Extracted {len(unique)} candidate items")
+        return unique
+
+    def parse_item_block(self, block: BeautifulSoup, base_url: str) -> Dict:
+        """Parse a single item block into a dictionary."""
+        title = None
+        link = None
+        image = None
+        snippet = None
+        price = None
+        currency = None
+        date_posted = None
+
+        # Find link and title - try multiple approaches
+        a = block.find("a", href=True)
+        if a:
+            link = requests.compat.urljoin(base_url, a["href"])
+            # Try header inside link
+            header = a.find(["h1", "h2", "h3", "h4", "span", "div"])
+            if header:
+                title = extract_text_from_tag(header)
+            else:
+                title = extract_text_from_tag(a)
+            
+            # Clean up title
+            if title:
+                title = title.strip()
+
+        # Title fallback - look in parent block
+        if not title:
+            header = block.find(["h1", "h2", "h3", "h4", "span"], class_=lambda x: x and any(kw in str(x).lower() for kw in ["title", "name", "heading"]))
+            if header:
+                title = extract_text_from_tag(header)
+        
+        # Another fallback - any header in block
+        if not title:
+            headers = block.find_all(["h1", "h2", "h3", "h4"])
+            if headers:
+                title = extract_text_from_tag(headers[0])
+        
+        # Last resort - first non-empty text
+        if not title:
+            text = extract_text_from_tag(block)
+            # Take first 100 chars as title
+            if text and len(text.strip()) > 10:
+                title = text.strip()[:100].split('\n')[0].strip()
+
+        # Snippet
+        p = block.find("p")
+        if p:
+            snippet = extract_text_from_tag(p)
+
+        # Image
+        img = block.find("img")
+        if img and img.get("src"):
+            image = requests.compat.urljoin(base_url, img.get("src"))
+        elif img and img.get("data-src"):
+            image = requests.compat.urljoin(base_url, img.get("data-src"))
+
+        # Price
+        text_all = extract_text_from_tag(block)
+        price_val, currency_val = normalize_price(text_all)
+        if price_val:
+            price = price_val
+            currency = currency_val or "грн"
+
+        # Date
+        time_tag = block.find("time")
+        if time_tag and time_tag.get("datetime"):
+            try:
+                date_posted = dateparser.parse(time_tag["datetime"])
+            except Exception:
+                date_posted = None
+        else:
+            date_match = re.search(r"\b(\d{1,2}\.\d{1,2}\.\d{2,4})\b", text_all)
+            if date_match:
+                try:
+                    date_posted = dateparser.parse(date_match.group(1), dayfirst=True)
+                except Exception:
+                    date_posted = None
+
+        return {
+            "title": title.strip() if title else None,
+            "url": link,
+            "snippet": snippet.strip() if snippet else None,
+            "image_url": image,
+            "price": price,
+            "currency": currency,
+            "date_posted": date_posted.isoformat() if date_posted else None,
+        }
+
+    def scrape(self, start_url: str, max_pages: int = 0) -> List[Dict]:
+        """
+        Scrape category pages using Playwright for JavaScript rendering.
+
+        Args:
+            start_url: Starting category URL
+            max_pages: Maximum pages to scrape (0 = no limit, uses config default)
+
+        Returns:
+            List of listing dictionaries
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error(
+                "Playwright is required for Fora scraper. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
+            return []
+
+        if not self.is_allowed_by_robots(start_url):
+            logger.warning("Scraping disallowed by robots.txt. Aborting.")
+            return []
+
+        # Initialize browser
+        try:
+            self._init_browser()
+        except Exception as e:
+            logger.exception("Failed to initialize Playwright browser: %s", e)
+            return []
+
+        results = []
+        url = start_url
+        page_count = 0
+
+        try:
+            while url:
+                if max_pages > 0 and page_count >= max_pages:
+                    logger.info("Reached max pages (%s). Stopping.", max_pages)
+                    break
+                if page_count >= self.max_pages:
+                    logger.warning(
+                        "Reached safety MAX_PAGES (%s). Stopping.", self.max_pages
+                    )
+                    break
+
+                try:
+                    html = self.fetch_with_playwright(url)
+                except Exception as e:
+                    logger.exception("Failed fetching page %s: %s", url, e)
+                    break
+
+                soup = self.parse_html(html)
+                blocks = self.extract_candidate_items(soup)
+                logger.info("Found %s candidate blocks on page %d: %s", len(blocks), page_count + 1, url)
+
+                for block in blocks:
+                    item = self.parse_item_block(block, self.base_url)
+                    # Accept item if it has either URL or title (or both)
+                    if item.get("url") is None and item.get("title") is None:
+                        continue
+                    # Don't skip items with just URL but no title (might be valid products)
+                    if item.get("url"):
+                        results.append(item)
+                        logger.debug(f"Added item: {item.get('title', 'No title')[:50]} - {item.get('url', 'No URL')[:60]}")
+                    elif item.get("title"):
+                        logger.debug(f"Item with title but no URL: {item.get('title')[:50]}")
+                        results.append(item)
+
+                page_count += 1
+                next_url = self.find_pagination_next(soup, url)
+                if not next_url:
+                    logger.info("No next page found. Stopping after %d pages.", page_count)
+                    break
+                if next_url == url:
+                    logger.warning("Next URL equals current URL; stopping to avoid loop.")
+                    break
+                url = next_url
+                
+                # Rate limiting between pages
+                import time
+                time.sleep(self.sleep_between_requests)
+
+        finally:
+            # Always close browser
+            self._close_browser()
+
+        logger.info("Scraped %d items from %d pages", len(results), page_count)
+        return results
+
+    def cleanup(self):
+        """Clean up resources."""
+        self._close_browser()
+        super().cleanup()
