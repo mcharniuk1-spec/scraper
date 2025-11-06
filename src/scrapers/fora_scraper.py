@@ -1,85 +1,113 @@
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
-from src.core.scraper_base import BaseScraper
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time
 import logging
+from typing import List, Dict
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+import requests
+
+from src.scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-class ForaScraper(BaseScraper):
-    """Scraper for Fora.ua using Playwright."""
-    def __init__(self, config: Dict, progress_file: str):
-        super().__init__(config, progress_file)
-        self.base_url = config['base_url']
-        self.site_name = config['site_name']
-        self.selectors = config['selectors']
 
-    def scrape_products(self, max_pages: Optional[int] = None) -> List[Dict]:
-        """Скрапінг сторінок каталогу методом headless."""
-        products = []
-        max_pages = max_pages or self.config.get('max_pages', 10)
-        self.log_progress(f"🚀 Запускаємо скрейпінг Fora до {max_pages} сторінок")
+class ForaScraper(BaseScraper):
+    """
+    Scraper for Fora.ua
+    """
+
+    def __init__(self, **kwargs):
+        defaults = {
+            "base_url": "https://fora.ua",
+            "start_url": "https://fora.ua/category/molochni-produkty-ta-iaitsia-2656",
+            "user_agent": "fora-scraper/1.0",
+            "timeout": 20,
+            "sleep_between_requests": 1.0,
+            "max_retries": 5,
+            "max_pages": 0,
+            "site": "fora",
+            "category": "molochni-produkty-ta-iaitsia",
+        }
+        defaults.update(kwargs)
+        super().__init__(**defaults)
+
+    # -----------------------------
+    # Internal page parsing helpers
+    # -----------------------------
+
+    def parse_product_card(self, card) -> Dict:
+        """
+        Extract structured product data from a single card element.
+        """
+        title = card.select_one(".product-card__title")
+        title = title.get_text(strip=True) if title else None
+
+        price_el = card.select_one(".product-card__price-current")
+        price = None
+        if price_el:
+            try:
+                price = float(price_el.get_text(strip=True).replace("грн", "").replace(",", "."))
+            except ValueError:
+                price = None
+
+        link_el = card.select_one("a")
+        url = None
+        if link_el and link_el.get("href"):
+            url = requests.compat.urljoin(self.base_url, link_el["href"])
+
+        image_el = card.select_one("img")
+        img_url = None
+        if image_el and image_el.get("src"):
+            img_url = requests.compat.urljoin(self.base_url, image_el["src"])
+
+        return {
+            "title": title,
+            "url": url,
+            "snippet": None,
+            "image_url": img_url,
+            "price": price,
+            "currency": "грн",
+            "date_posted": None,
+        }
+
+    # -----------------------------
+    # Core scraping
+    # -----------------------------
+
+    def scrape(self, start_url: str, max_pages: int = 0) -> List[Dict]:
+        """
+        Scrape product listings from Fora.ua dynamically rendered pages.
+        """
+        all_results = []
+        page_number = 1
+
+        logger.info("Starting Fora scraper at %s", start_url)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            for page_num in range(1, max_pages + 1):
-                url = self._build_page_url(page_num)
-                self.log_progress(f"📄 Опрацьовуємо сторінку {page_num}/{max_pages}: {url}")
+            context = browser.new_context()
+            page = context.new_page()
+
+            while True:
+                paged_url = f"{start_url}?page={page_number}"
+                logger.info("Scraping page %d: %s", page_number, paged_url)
+                page.goto(paged_url, timeout=60000)
                 try:
-                    page.goto(url, timeout=self.config.get('timeout', 30000))
-                    # дочекаємося, поки з’являться картки товарів
-                    page.wait_for_selector(self.selectors['product_cards'], timeout=15000)
-                    html = page.content()
-                except Exception as e:
-                    self.log_error(f"Не вдалося завантажити сторінку {page_num}: {e}")
+                    page.wait_for_selector(".product-card__title", timeout=15000)
+                except Exception:
+                    logger.warning("Timeout waiting for products on page %d", page_number)
                     break
 
-                soup = BeautifulSoup(html, 'html.parser')
-                cards = self._find_product_cards(soup)
+                html = page.content()
+                soup = BeautifulSoup(html, "lxml")
+                cards = soup.select(".product-card__content")
+
                 if not cards:
-                    self.log_progress(f"⚠️ На сторінці {page_num} немає товарів, зупиняємось")
+                    logger.info("No products found on page %d, stopping.", page_number)
                     break
 
-                for i, card in enumerate(cards, 1):
+                for card in cards:
                     try:
-                        product = self._parse_product_card(card)
-                        if product and product.get('url'):
-                            details = self.parse_product_page(product['url'], page)
-                            if details:
-                                product.update(details)
-                            products.append(product)
-                            self.log_progress(f"  ✅ Товар {i}: {product.get('product_name')[:50]}")
-                    except Exception as e:
-                        self.log_error(f"Помилка при обробці картки {i} на сторінці {page_num}: {e}")
-                self.products_found += len(cards)
-            browser.close()
-
-        self.log_progress(f"🎉 Завершено Fora: знайдено {len(products)} товарів")
-        return products
-
-    def parse_product_page(self, url: str, page) -> Optional[Dict]:
-        """Відкриває сторінку товару у вже відкритому браузері."""
-        try:
-            page.goto(url, timeout=self.config.get('timeout', 30000))
-            page.wait_for_load_state('domcontentloaded')
-            html = page.content()
-            soup = BeautifulSoup(html, 'html.parser')
-            data = {}
-            title = self._extract_page_title(soup)
-            if title:
-                data['product_name'] = title
-            description = self._extract_description(soup)
-            if description:
-                data['description'] = description
-            price = self._extract_page_price(soup)
-            if price:
-                data['price'] = price
-            img = self._extract_image(soup)
-            if img:
-                data['image_url'] = img
-            availability = self._extract_page_availability(soup)
-            data['availability'] = availability
-            return data
-        except Exception as e:
-            self.log_error(f"Не вдалося розібрати сторінку {url}: {e}")
-            return None
+                        product = self.pars
