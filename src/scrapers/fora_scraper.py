@@ -1,113 +1,68 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import time
+# src/scrapers/fora_scraper.py
+import asyncio
 import logging
-from typing import List, Dict
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
-import requests
-
+from playwright.async_api import async_playwright
 from src.scrapers.base_scraper import BaseScraper
 
 logger = logging.getLogger(__name__)
 
-
 class ForaScraper(BaseScraper):
-    """
-    Scraper for Fora.ua
-    """
+    """Playwright-based scraper for fora.ua"""
 
-    def __init__(self, **kwargs):
-        defaults = {
-            "base_url": "https://fora.ua",
-            "start_url": "https://fora.ua/category/molochni-produkty-ta-iaitsia-2656",
-            "user_agent": "fora-scraper/1.0",
-            "timeout": 20,
-            "sleep_between_requests": 1.0,
-            "max_retries": 5,
-            "max_pages": 0,
-            "site": "fora",
-            "category": "molochni-produkty-ta-iaitsia",
-        }
-        defaults.update(kwargs)
-        super().__init__(**defaults)
+    async def _scrape_page(self, page, url):
+        """Scrape a single product listing page."""
+        await page.goto(url, wait_until="networkidle")
+        await page.wait_for_selector("div.product-item", timeout=15000)
 
-    # -----------------------------
-    # Internal page parsing helpers
-    # -----------------------------
+        elements = await page.query_selector_all("div.product-item")
+        products = []
+        for el in elements:
+            title = await el.query_selector_eval("a.product-item__title", "el => el.textContent.trim()") or ""
+            price = await el.query_selector_eval("span.price__value", "el => el.textContent.trim()") or ""
+            href = await el.query_selector_eval("a.product-item__title", "el => el.href") or None
+            image = await el.query_selector_eval("img", "el => el.src") or None
+            products.append({
+                "title": title,
+                "url": href,
+                "snippet": "",
+                "image_url": image,
+                "price": price,
+                "currency": "грн",
+                "date_posted": None,
+            })
+        return products
 
-    def parse_product_card(self, card) -> Dict:
-        """
-        Extract structured product data from a single card element.
-        """
-        title = card.select_one(".product-card__title")
-        title = title.get_text(strip=True) if title else None
-
-        price_el = card.select_one(".product-card__price-current")
-        price = None
-        if price_el:
-            try:
-                price = float(price_el.get_text(strip=True).replace("грн", "").replace(",", "."))
-            except ValueError:
-                price = None
-
-        link_el = card.select_one("a")
-        url = None
-        if link_el and link_el.get("href"):
-            url = requests.compat.urljoin(self.base_url, link_el["href"])
-
-        image_el = card.select_one("img")
-        img_url = None
-        if image_el and image_el.get("src"):
-            img_url = requests.compat.urljoin(self.base_url, image_el["src"])
-
-        return {
-            "title": title,
-            "url": url,
-            "snippet": None,
-            "image_url": img_url,
-            "price": price,
-            "currency": "грн",
-            "date_posted": None,
-        }
-
-    # -----------------------------
-    # Core scraping
-    # -----------------------------
-
-    def scrape(self, start_url: str, max_pages: int = 0) -> List[Dict]:
-        """
-        Scrape product listings from Fora.ua dynamically rendered pages.
-        """
-        all_results = []
-        page_number = 1
-
-        logger.info("Starting Fora scraper at %s", start_url)
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
+    async def _scrape_all(self, start_url, max_pages):
+        all_products = []
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(user_agent=self.user_agent)
+            current_page = 1
+            url = start_url
 
             while True:
-                paged_url = f"{start_url}?page={page_number}"
-                logger.info("Scraping page %d: %s", page_number, paged_url)
-                page.goto(paged_url, timeout=60000)
-                try:
-                    page.wait_for_selector(".product-card__title", timeout=15000)
-                except Exception:
-                    logger.warning("Timeout waiting for products on page %d", page_number)
+                logger.info(f"Scraping page {current_page}: {url}")
+                products = await self._scrape_page(page, url)
+                if not products:
+                    break
+                all_products.extend(products)
+                if 0 < max_pages <= current_page:
                     break
 
-                html = page.content()
-                soup = BeautifulSoup(html, "lxml")
-                cards = soup.select(".product-card__content")
-
-                if not cards:
-                    logger.info("No products found on page %d, stopping.", page_number)
+                # try to navigate to the next page
+                next_btn = await page.query_selector("a.pagination__next")
+                if not next_btn:
                     break
+                next_href = await next_btn.get_attribute("href")
+                if not next_href:
+                    break
+                url = self.base_url + next_href
+                current_page += 1
 
-                for card in cards:
-                    try:
-                        product = self.pars
+            await browser.close()
+        return all_products
+
+    def scrape(self, start_url, max_pages=0):
+        """Entry point for synchronous invocation"""
+        return asyncio.run(self._scrape_all(start_url, max_pages))
