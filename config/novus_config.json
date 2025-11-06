@@ -1,24 +1,11 @@
 {
-  "site": "novus",
-  "site_name": "Novus Zakaz",
   "base_url": "https://novus.zakaz.ua",
   "start_url": "https://novus.zakaz.ua/uk/categories/dairy-and-eggs/",
+  "user_agent": "novus-scraper/1.0 (+https://github.com/yourname/novus-scraper) Python-requests",
   "timeout": 20,
-  "sleep_between_requests": 0.8,
-  "max_retries": 3,
+  "sleep_between_requests": 0.5,
+  "max_retries": 5,
   "max_pages": 10,
-  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-  "excel_path": "data/novus_listings.xlsx",
-  "db_path": "data/novus_listings.db",
-  "selectors": {
-    "card": "li[data-qa='product'], li[data-qa^='product-'], li.product-item, div[data-qa='product']",
-    "title": "a[data-qa='product-title'], a[title], h3, .title",
-    "link": "a[href]",
-    "price_block": "[data-qa='product-price'], .price, .product-price, [class*='price']",
-    "promo_price": "[data-qa='product-price__main'], .price__main, .product-price__current",
-    "old_price": "[data-qa='product-price__old'], .price__old, .product-price__old",
-    "per_unit": "[data-qa='product-price__additional'], .price__per, .product-price__per",
-    "image": "img[src], img[data-src]",
-    "weight": "[data-qa='product-weight'], .product-weight, [class*='weight'], [class*='volume']"
-  }
+  "site": "novus",
+  "category": "dairy-and-eggs"
 }
