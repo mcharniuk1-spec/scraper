@@ -1,0 +1,11 @@
+{
+  "base_url": "https://fora.ua",
+  "start_url": "https://fora.ua/category/molochni-produkty-ta-iaitsia-2656",
+  "user_agent": "fora-scraper/1.0 (+https://github.com/yourname/fora-scraper) Python-requests",
+  "timeout": 20,
+  "sleep_between_requests": 1.0,
+  "max_retries": 5,
+  "max_pages": 10,
+  "site": "fora",
+  "category": "molochni-produkty-ta-iaitsia"
+}
