@@ -1,0 +1,14 @@
+{
+  "name": "fora-runner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated Puppeteer runner for scraping Fora only",
+  "scripts": {
+    "scrape": "node scrape-fora.mjs",
+    "scrape:quick": "MAX_PAGES=1 node scrape-fora.mjs"
+  },
+  "dependencies": {
+    "puppeteer": "^22.10.0"
+  }
+}
