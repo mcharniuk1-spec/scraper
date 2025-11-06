@@ -1,80 +1,37 @@
-name: Fora Scraper (Puppeteer only)
+name: Fora Scraper (Playwright)
 
 on:
+  schedule:
+    - cron: "0 */12 * * *"   # every 12 hours
   workflow_dispatch:
-    inputs:
-      max_pages:
-        description: 'Max pages to scrape (Fora)'
-        required: false
-        default: '5'
-  # (Опційно) Розклад — ранок/вечір EET
-  # schedule:
-  #   - cron: '0 9 * * *'   # 11:00 EET
-  #   - cron: '0 21 * * *'  # 23:00 EET
 
 jobs:
-  fora-scrape:
+  scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- Node/Puppeteer тільки для Fora ---
-      - name: Use Node 20
-        uses: actions/setup-node@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          node-version: '20'
+          python-version: "3.11"
 
-      - name: Install Puppeteer deps
-        working-directory: ./fora-runner
-        run: |
-          npm ci
-          # Puppeteer сам завантажить Chromium під час першого запуску
-
-      - name: Run Puppeteer scraper (Fora)
-        working-directory: ./fora-runner
-        env:
-          MAX_PAGES: ${{ github.event.inputs.max_pages || 5 }}
-          OUTPUT_DIR: ../data/fora
-        run: |
-          node scrape-fora.mjs
-
-      # --- Python інжест JSON → SQLite + Excel ---
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install python deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas openpyxl
+          pip install -r requirements.txt
+          playwright install chromium
 
-      - name: Ingest Fora JSON → SQLite + Excel
+      - name: Run Fora Scraper
+        run: python scripts/run_scraper.py --site fora --max-pages 10
+
+      - name: Commit results
         run: |
-          python scripts/ingest_fora_json.py
-
-      # --- Комітимо результати ---
-      - name: Commit & push data artifacts
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Actions Bot"
-
-          git add data/fora/ data/monitoring/
-          if ! git diff --cached --quiet; then
-            git commit -m "Fora scrape (Puppeteer) artifacts: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
-          else
-            echo "No changes to commit."
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: fora-artifacts-${{ github.run_number }}
-          path: |
-            data/fora/**
-            data/monitoring/**
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add data/*.xlsx data/*.db || true
+          git commit -m "Auto-scrape: Update Fora listings $(date -u)" || echo "No changes to commit"
+          git push
