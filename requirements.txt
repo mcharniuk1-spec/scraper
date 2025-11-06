@@ -15,4 +15,4 @@ python-dateutil>=2.8.2
 # aiohttp>=3.8.0  # For async scraping (future enhancement)
 
 # Playwright for JavaScript rendering (required for Fora scraper)
-playwright>=1.40.0
+playwright>=1.45.0
